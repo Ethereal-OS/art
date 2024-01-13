@@ -55,6 +55,7 @@
 #include "select_generator.h"
 #include "sharpening.h"
 #include "side_effects_analysis.h"
+#include "write_barrier_elimination.h"
 
 // Decide between default or alternative pass name.
 
@@ -95,6 +96,8 @@ const char* OptimizationPassName(OptimizationPass pass) {
       return ConstructorFenceRedundancyElimination::kCFREPassName;
     case OptimizationPass::kScheduling:
       return HInstructionScheduling::kInstructionSchedulingPassName;
+    case OptimizationPass::kWriteBarrierElimination:
+      return WriteBarrierElimination::kWBEPassName;
 #ifdef ART_ENABLE_CODEGEN_arm
     case OptimizationPass::kInstructionSimplifierArm:
       return arm::InstructionSimplifierArm::kInstructionSimplifierArmPassName;
@@ -221,7 +224,7 @@ ArenaVector<HOptimization*> ConstructOptimizations(
       // Regular passes.
       //
       case OptimizationPass::kConstantFolding:
-        opt = new (allocator) HConstantFolding(graph, pass_name);
+        opt = new (allocator) HConstantFolding(graph, stats, pass_name);
         break;
       case OptimizationPass::kDeadCodeElimination:
         opt = new (allocator) HDeadCodeElimination(graph, stats, pass_name);
@@ -266,6 +269,9 @@ ArenaVector<HOptimization*> ConstructOptimizations(
         break;
       case OptimizationPass::kLoadStoreElimination:
         opt = new (allocator) LoadStoreElimination(graph, stats, pass_name);
+        break;
+      case OptimizationPass::kWriteBarrierElimination:
+        opt = new (allocator) WriteBarrierElimination(graph, stats, pass_name);
         break;
       case OptimizationPass::kScheduling:
         opt = new (allocator) HInstructionScheduling(

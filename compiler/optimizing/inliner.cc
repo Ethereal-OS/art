@@ -201,6 +201,10 @@ bool HInliner::Run() {
     }
   }
 
+  if (did_set_always_throws) {
+    graph_->SetHasAlwaysThrowingInvokes(/* value= */ true);
+  }
+
   return did_inline || did_set_always_throws;
 }
 
@@ -1416,9 +1420,9 @@ bool HInliner::IsInliningSupported(const HInvoke* invoke_instruction,
   return true;
 }
 
-// Returns whether our resource limits allow inlining this method.
-bool HInliner::IsInliningBudgetAvailable(ArtMethod* method,
-                                         const CodeItemDataAccessor& accessor) const {
+bool HInliner::IsInliningEncouraged(const HInvoke* invoke_instruction,
+                                    ArtMethod* method,
+                                    const CodeItemDataAccessor& accessor) const {
   if (CountRecursiveCallsOf(method) > kMaximumNumberOfRecursiveCalls) {
     LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedRecursiveBudget)
         << "Method "
@@ -1435,6 +1439,13 @@ bool HInliner::IsInliningBudgetAvailable(ArtMethod* method,
         << accessor.InsnsSizeInCodeUnits()
         << " > "
         << inline_max_code_units;
+    return false;
+  }
+
+  if (invoke_instruction->GetBlock()->GetLastInstruction()->IsThrow()) {
+    LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedEndsWithThrow)
+        << "Method " << method->PrettyMethod()
+        << " is not inlined because its block ends with a throw";
     return false;
   }
 
@@ -1503,7 +1514,7 @@ bool HInliner::TryBuildAndInline(HInvoke* invoke_instruction,
     return false;
   }
 
-  if (!IsInliningBudgetAvailable(method, accessor)) {
+  if (!IsInliningEncouraged(invoke_instruction, method, accessor)) {
     return false;
   }
 
@@ -2099,12 +2110,12 @@ void HInliner::RunOptimizations(HGraph* callee_graph,
   // Note: if the outermost_graph_ is being compiled OSR, we should not run any
   // optimization that could lead to a HDeoptimize. The following optimizations do not.
   HDeadCodeElimination dce(callee_graph, inline_stats_, "dead_code_elimination$inliner");
-  HConstantFolding fold(callee_graph, "constant_folding$inliner");
+  HConstantFolding fold(callee_graph, inline_stats_, "constant_folding$inliner");
   InstructionSimplifier simplify(callee_graph, codegen_, inline_stats_);
 
   HOptimization* optimizations[] = {
-    &simplify,
     &fold,
+    &simplify,
     &dce,
   };
 

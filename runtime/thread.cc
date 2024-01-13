@@ -166,7 +166,7 @@ void InitEntryPoints(JniEntryPoints* jpoints,
 void UpdateReadBarrierEntrypoints(QuickEntryPoints* qpoints, bool is_active);
 
 void Thread::SetIsGcMarkingAndUpdateEntrypoints(bool is_marking) {
-  CHECK(kUseReadBarrier);
+  CHECK(gUseReadBarrier);
   tls32_.is_gc_marking = is_marking;
   UpdateReadBarrierEntrypoints(&tlsPtr_.quick_entrypoints, /* is_active= */ is_marking);
 }
@@ -433,15 +433,18 @@ void Thread::PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type
   tlsPtr_.stacked_shadow_frame_record = record;
 }
 
-ShadowFrame* Thread::PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present) {
+ShadowFrame* Thread::MaybePopDeoptimizedStackedShadowFrame() {
   StackedShadowFrameRecord* record = tlsPtr_.stacked_shadow_frame_record;
-  if (must_be_present) {
-    DCHECK(record != nullptr);
-  } else {
-    if (record == nullptr || record->GetType() != type) {
-      return nullptr;
-    }
+  if (record == nullptr ||
+      record->GetType() != StackedShadowFrameType::kDeoptimizationShadowFrame) {
+    return nullptr;
   }
+  return PopStackedShadowFrame();
+}
+
+ShadowFrame* Thread::PopStackedShadowFrame() {
+  StackedShadowFrameRecord* record = tlsPtr_.stacked_shadow_frame_record;
+  DCHECK_NE(record, nullptr);
   tlsPtr_.stacked_shadow_frame_record = record->GetLink();
   ShadowFrame* shadow_frame = record->GetShadowFrame();
   delete record;
@@ -531,7 +534,7 @@ ShadowFrame* Thread::FindOrCreateDebuggerShadowFrame(size_t frame_id,
     return shadow_frame;
   }
   VLOG(deopt) << "Create pre-deopted ShadowFrame for " << ArtMethod::PrettyMethod(method);
-  shadow_frame = ShadowFrame::CreateDeoptimizedFrame(num_vregs, nullptr, method, dex_pc);
+  shadow_frame = ShadowFrame::CreateDeoptimizedFrame(num_vregs, method, dex_pc);
   FrameIdToShadowFrame* record = FrameIdToShadowFrame::Create(frame_id,
                                                               shadow_frame,
                                                               tlsPtr_.frame_id_to_shadow_frame,
@@ -786,7 +789,7 @@ void Thread::InstallImplicitProtection() {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wframe-larger-than="
     NO_INLINE
-    static void Touch(uintptr_t target) {
+    __attribute__((no_sanitize("memtag"))) static void Touch(uintptr_t target) {
       volatile size_t zero = 0;
       // Use a large local volatile array to ensure a large frame size. Do not use anything close
       // to a full page for ASAN. It would be nice to ensure the frame size is at most a page, but
@@ -1473,7 +1476,7 @@ bool Thread::ModifySuspendCountInternal(Thread* self,
     return false;
   }
 
-  if (kUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
+  if (gUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
     // Force retry of a suspend request if it's in the middle of a thread flip to avoid a
     // deadlock. b/31683379.
     return false;
@@ -2559,7 +2562,7 @@ void Thread::Destroy() {
   }
   // Mark-stack revocation must be performed at the very end. No
   // checkpoint/flip-function or read-barrier should be called after this.
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     Runtime::Current()->GetHeap()->ConcurrentCopyingCollector()->RevokeThreadLocalMarkStack(this);
   }
 }
@@ -3851,7 +3854,11 @@ class ReferenceMapVisitor : public StackVisitor {
         // We are visiting the references in compiled frames, so we do not need
         // to know the inlined frames.
       : StackVisitor(thread, context, StackVisitor::StackWalkKind::kSkipInlinedFrames),
-        visitor_(visitor) {}
+        visitor_(visitor) {
+    gc::Heap* const heap = Runtime::Current()->GetHeap();
+    visit_declaring_class_ = heap->CurrentCollectorType() != gc::CollectorType::kCollectorTypeCMC
+                             || !heap->MarkCompactCollector()->IsCompacting(Thread::Current());
+  }
 
   bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (false) {
@@ -3896,6 +3903,9 @@ class ReferenceMapVisitor : public StackVisitor {
   void VisitDeclaringClass(ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_)
       NO_THREAD_SAFETY_ANALYSIS {
+    if (!visit_declaring_class_) {
+      return;
+    }
     ObjPtr<mirror::Class> klass = method->GetDeclaringClassUnchecked<kWithoutReadBarrier>();
     // klass can be null for runtime methods.
     if (klass != nullptr) {
@@ -4189,6 +4199,7 @@ class ReferenceMapVisitor : public StackVisitor {
 
   // Visitor for when we visit a root.
   RootVisitor& visitor_;
+  bool visit_declaring_class_;
 };
 
 class RootCallbackVisitor {
@@ -4282,6 +4293,9 @@ void Thread::VisitRoots(RootVisitor* visitor) {
 
 static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, size_t* value)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  // WARNING: The interpreter will not modify the cache while this method is running in GC.
+  //          However, ClearAllInterpreterCaches can still run if any dex file is closed.
+  //          Therefore the cache entry can be nulled at any point through this method.
   if (inst == nullptr) {
     return;
   }
@@ -4307,6 +4321,9 @@ static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, s
     case Opcode::CONST_STRING:
     case Opcode::CONST_STRING_JUMBO: {
       mirror::Object* object = reinterpret_cast<mirror::Object*>(*value);
+      if (object == nullptr) {
+        return;
+      }
       mirror::Object* new_object = visitor->IsMarked(object);
       // We know the string is marked because it's a strongly-interned string that
       // is always alive (see b/117621117 for trying to make those strings weak).
@@ -4425,6 +4442,15 @@ bool Thread::HasTlab() const {
   return has_tlab;
 }
 
+void Thread::AdjustTlab(size_t slide_bytes) {
+  if (HasTlab()) {
+    tlsPtr_.thread_local_start -= slide_bytes;
+    tlsPtr_.thread_local_pos -= slide_bytes;
+    tlsPtr_.thread_local_end -= slide_bytes;
+    tlsPtr_.thread_local_limit -= slide_bytes;
+  }
+}
+
 std::ostream& operator<<(std::ostream& os, const Thread& thread) {
   thread.ShortDump(os);
   return os;
@@ -4471,8 +4497,8 @@ size_t Thread::NumberOfHeldMutexes() const {
 void Thread::DeoptimizeWithDeoptimizationException(JValue* result) {
   DCHECK_EQ(GetException(), Thread::GetDeoptimizationException());
   ClearException();
-  ShadowFrame* shadow_frame =
-      PopStackedShadowFrame(StackedShadowFrameType::kDeoptimizationShadowFrame);
+  ShadowFrame* shadow_frame = MaybePopDeoptimizedStackedShadowFrame();
+  DCHECK_NE(shadow_frame, nullptr);
   ObjPtr<mirror::Throwable> pending_exception;
   bool from_code = false;
   DeoptimizationMethodType method_type;
@@ -4534,7 +4560,7 @@ bool Thread::IsAotCompiler() {
 mirror::Object* Thread::GetPeerFromOtherThread() const {
   DCHECK(tlsPtr_.jpeer == nullptr);
   mirror::Object* peer = tlsPtr_.opeer;
-  if (kUseReadBarrier && Current()->GetIsGcMarking()) {
+  if (gUseReadBarrier && Current()->GetIsGcMarking()) {
     // We may call Thread::Dump() in the middle of the CC thread flip and this thread's stack
     // may have not been flipped yet and peer may be a from-space (stale) ref. So explicitly
     // mark/forward it here.

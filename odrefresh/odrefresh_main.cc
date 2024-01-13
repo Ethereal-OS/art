@@ -26,6 +26,7 @@
 #include "arch/instruction_set.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
+#include "base/stl_util.h"
 #include "odr_common.h"
 #include "odr_compilation_log.h"
 #include "odr_config.h"
@@ -40,6 +41,7 @@ using ::android::base::StartsWith;
 using ::art::odrefresh::CompilationOptions;
 using ::art::odrefresh::ExitCode;
 using ::art::odrefresh::kCheckedSystemPropertyPrefixes;
+using ::art::odrefresh::kIgnoredSystemProperties;
 using ::art::odrefresh::kSystemProperties;
 using ::art::odrefresh::OdrCompilationLog;
 using ::art::odrefresh::OdrConfig;
@@ -144,6 +146,8 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
       config->SetArtifactDirectory(GetApexDataDalvikCacheDirectory(art::InstructionSet::kNone));
     } else if (ArgumentMatches(arg, "--zygote-arch=", &value)) {
       zygote = value;
+    } else if (ArgumentMatches(arg, "--boot-image-compiler-filter=", &value)) {
+      config->SetBootImageCompilerFilter(value);
     } else if (ArgumentMatches(arg, "--system-server-compiler-filter=", &value)) {
       config->SetSystemServerCompilerFilter(value);
     } else if (ArgumentMatches(arg, "--staging-dir=", &value)) {
@@ -172,7 +176,7 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
   config->SetZygoteKind(zygote_kind);
 
   if (config->GetSystemServerCompilerFilter().empty()) {
-    std::string filter = GetProperty("dalvik.vm.systemservercompilerfilter", "speed");
+    std::string filter = GetProperty("dalvik.vm.systemservercompilerfilter", "");
     config->SetSystemServerCompilerFilter(filter);
   }
 
@@ -195,7 +199,7 @@ void GetSystemProperties(std::unordered_map<std::string, std::string>* system_pr
       return;
     }
     for (const char* prefix : kCheckedSystemPropertyPrefixes) {
-      if (StartsWith(name, prefix)) {
+      if (StartsWith(name, prefix) && !art::ContainsElement(kIgnoredSystemProperties, name)) {
         (*system_properties)[name] = value;
       }
     }
@@ -232,6 +236,9 @@ NO_RETURN void UsageHelp(const char* argv0) {
   UsageMsg("--staging-dir=<DIR>              Write temporary artifacts to <DIR> rather than");
   UsageMsg("                                 .../staging");
   UsageMsg("--zygote-arch=<STRING>           Zygote kind that overrides ro.zygote");
+  UsageMsg("--boot-image-compiler-filter=<STRING>");
+  UsageMsg("                                 Compiler filter for the boot image. Default: ");
+  UsageMsg("                                 speed-profile");
   UsageMsg("--system-server-compiler-filter=<STRING>");
   UsageMsg("                                 Compiler filter that overrides");
   UsageMsg("                                 dalvik.vm.systemservercompilerfilter");

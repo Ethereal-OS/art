@@ -43,6 +43,7 @@
 #include "base/hash_set.h"
 #include "base/leb128.h"
 #include "base/logging.h"
+#include "base/mem_map_arena_pool.h"
 #include "base/metrics/metrics.h"
 #include "base/mutex-inl.h"
 #include "base/os.h"
@@ -96,7 +97,7 @@
 #include "jit/jit_code_cache.h"
 #include "jni/java_vm_ext.h"
 #include "jni/jni_internal.h"
-#include "linear_alloc.h"
+#include "linear_alloc-inl.h"
 #include "mirror/array-alloc-inl.h"
 #include "mirror/array-inl.h"
 #include "mirror/call_site.h"
@@ -270,7 +271,6 @@ class ClassLinker::VisiblyInitializedCallback final
   }
 
   void Run(Thread* self) override {
-    self->ClearMakeVisiblyInitializedCounter();
     AdjustThreadVisibilityCounter(self, -1);
   }
 
@@ -2029,7 +2029,7 @@ bool ClassLinker::AddImageSpace(
 
   if (runtime->IsVerificationSoftFail()) {
     header.VisitPackedArtMethods([&](ArtMethod& method) REQUIRES_SHARED(Locks::mutator_lock_) {
-      if (!method.IsNative() && method.IsInvokable()) {
+      if (method.IsManagedAndInvokable()) {
         method.ClearSkipAccessChecks();
       }
     }, space->Begin(), image_pointer_size_);
@@ -2120,7 +2120,7 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
   const bool tracing_enabled = Trace::IsTracingEnabled();
   Thread* const self = Thread::Current();
   WriterMutexLock mu(self, *Locks::classlinker_classes_lock_);
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     // We do not track new roots for CC.
     DCHECK_EQ(0, flags & (kVisitRootFlagNewRoots |
                           kVisitRootFlagClearRootLog |
@@ -2156,7 +2156,7 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
         root.VisitRoot(visitor, RootInfo(kRootVMInternal));
       }
     }
-  } else if (!kUseReadBarrier && (flags & kVisitRootFlagNewRoots) != 0) {
+  } else if (!gUseReadBarrier && (flags & kVisitRootFlagNewRoots) != 0) {
     for (auto& root : new_class_roots_) {
       ObjPtr<mirror::Class> old_ref = root.Read<kWithoutReadBarrier>();
       root.VisitRoot(visitor, RootInfo(kRootStickyClass));
@@ -2177,13 +2177,13 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
       }
     }
   }
-  if (!kUseReadBarrier && (flags & kVisitRootFlagClearRootLog) != 0) {
+  if (!gUseReadBarrier && (flags & kVisitRootFlagClearRootLog) != 0) {
     new_class_roots_.clear();
     new_bss_roots_boot_oat_files_.clear();
   }
-  if (!kUseReadBarrier && (flags & kVisitRootFlagStartLoggingNewRoots) != 0) {
+  if (!gUseReadBarrier && (flags & kVisitRootFlagStartLoggingNewRoots) != 0) {
     log_new_roots_ = true;
-  } else if (!kUseReadBarrier && (flags & kVisitRootFlagStopLoggingNewRoots) != 0) {
+  } else if (!gUseReadBarrier && (flags & kVisitRootFlagStopLoggingNewRoots) != 0) {
     log_new_roots_ = false;
   }
   // We deliberately ignore the class roots in the image since we
@@ -2663,8 +2663,7 @@ bool ClassLinker::FindClassInSharedLibraries(ScopedObjectAccessAlreadyRunnable& 
                                              size_t hash,
                                              Handle<mirror::ClassLoader> class_loader,
                                              /*out*/ ObjPtr<mirror::Class>* result) {
-  ArtField* field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   return FindClassInSharedLibrariesHelper(soa, self, descriptor, hash, class_loader, field, result);
 }
 
@@ -2700,8 +2699,7 @@ bool ClassLinker::FindClassInSharedLibrariesAfter(ScopedObjectAccessAlreadyRunna
                                                   size_t hash,
                                                   Handle<mirror::ClassLoader> class_loader,
                                                   /*out*/ ObjPtr<mirror::Class>* result) {
-  ArtField* field = jni::DecodeArtField(
-      WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoadersAfter);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoadersAfter;
   return FindClassInSharedLibrariesHelper(soa, self, descriptor, hash, class_loader, field, result);
 }
 
@@ -3485,7 +3483,7 @@ LengthPrefixedArray<ArtField>* ClassLinker::AllocArtFieldArray(Thread* self,
   // If the ArtField alignment changes, review all uses of LengthPrefixedArray<ArtField>.
   static_assert(alignof(ArtField) == 4, "ArtField alignment is expected to be 4.");
   size_t storage_size = LengthPrefixedArray<ArtField>::ComputeSize(length);
-  void* array_storage = allocator->Alloc(self, storage_size);
+  void* array_storage = allocator->Alloc(self, storage_size, LinearAllocKind::kArtFieldArray);
   auto* ret = new(array_storage) LengthPrefixedArray<ArtField>(length);
   CHECK(ret != nullptr);
   std::uninitialized_fill_n(&ret->At(0), length, ArtField());
@@ -3502,7 +3500,7 @@ LengthPrefixedArray<ArtMethod>* ClassLinker::AllocArtMethodArray(Thread* self,
   const size_t method_size = ArtMethod::Size(image_pointer_size_);
   const size_t storage_size =
       LengthPrefixedArray<ArtMethod>::ComputeSize(length, method_size, method_alignment);
-  void* array_storage = allocator->Alloc(self, storage_size);
+  void* array_storage = allocator->Alloc(self, storage_size, LinearAllocKind::kArtMethodArray);
   auto* ret = new (array_storage) LengthPrefixedArray<ArtMethod>(length);
   CHECK(ret != nullptr);
   for (size_t i = 0; i < length; ++i) {
@@ -3825,34 +3823,30 @@ void ClassLinker::RegisterDexFileLocked(const DexFile& dex_file,
     // dex file location is /system/priv-app/SettingsProvider/SettingsProvider.apk
     CHECK_EQ(dex_cache_location, dex_file_suffix);
   }
+
+  // Check if we need to initialize OatFile data (.data.bimg.rel.ro and .bss
+  // sections) needed for code execution.
   const OatFile* oat_file =
       (dex_file.GetOatDexFile() != nullptr) ? dex_file.GetOatDexFile()->GetOatFile() : nullptr;
-  // Clean up pass to remove null dex caches; null dex caches can occur due to class unloading
-  // and we are lazily removing null entries. Also check if we need to initialize OatFile data
-  // (.data.bimg.rel.ro and .bss sections) needed for code execution.
   bool initialize_oat_file_data = (oat_file != nullptr) && oat_file->IsExecutable();
-  JavaVMExt* const vm = self->GetJniEnv()->GetVm();
-  for (auto it = dex_caches_.begin(); it != dex_caches_.end(); ) {
-    const DexCacheData& data = it->second;
-    if (self->IsJWeakCleared(data.weak_root)) {
-      vm->DeleteWeakGlobalRef(self, data.weak_root);
-      it = dex_caches_.erase(it);
-    } else {
-      if (initialize_oat_file_data &&
-          it->first->GetOatDexFile() != nullptr &&
-          it->first->GetOatDexFile()->GetOatFile() == oat_file) {
+  if (initialize_oat_file_data) {
+    for (const auto& entry : dex_caches_) {
+      if (!self->IsJWeakCleared(entry.second.weak_root) &&
+          entry.first->GetOatDexFile() != nullptr &&
+          entry.first->GetOatDexFile()->GetOatFile() == oat_file) {
         initialize_oat_file_data = false;  // Already initialized.
+        break;
       }
-      ++it;
     }
   }
   if (initialize_oat_file_data) {
     oat_file->InitializeRelocations();
   }
+
   // Let hiddenapi assign a domain to the newly registered dex file.
   hiddenapi::InitializeDexFileDomain(dex_file, class_loader);
 
-  jweak dex_cache_jweak = vm->AddWeakGlobalRef(self, dex_cache);
+  jweak dex_cache_jweak = self->GetJniEnv()->GetVm()->AddWeakGlobalRef(self, dex_cache);
   DexCacheData data;
   data.weak_root = dex_cache_jweak;
   data.class_table = ClassTableForClassLoader(class_loader);
@@ -5907,7 +5901,9 @@ bool ClassLinker::LinkClass(Thread* self,
     if (imt == nullptr) {
       LinearAlloc* allocator = GetAllocatorForClassLoader(klass->GetClassLoader());
       imt = reinterpret_cast<ImTable*>(
-          allocator->Alloc(self, ImTable::SizeInBytes(image_pointer_size_)));
+          allocator->Alloc(self,
+                           ImTable::SizeInBytes(image_pointer_size_),
+                           LinearAllocKind::kNoGCRoots));
       if (imt == nullptr) {
         return false;
       }
@@ -6190,8 +6186,9 @@ ArtMethod* ClassLinker::AddMethodToConflictTable(ObjPtr<mirror::Class> klass,
   // Allocate a new table. Note that we will leak this table at the next conflict,
   // but that's a tradeoff compared to making the table fixed size.
   void* data = linear_alloc->Alloc(
-      Thread::Current(), ImtConflictTable::ComputeSizeWithOneMoreEntry(current_table,
-                                                                       image_pointer_size_));
+      Thread::Current(),
+      ImtConflictTable::ComputeSizeWithOneMoreEntry(current_table, image_pointer_size_),
+      LinearAllocKind::kNoGCRoots);
   if (data == nullptr) {
     LOG(ERROR) << "Failed to allocate conflict table";
     return conflict_method;
@@ -6305,8 +6302,8 @@ ImtConflictTable* ClassLinker::CreateImtConflictTable(size_t count,
                                                       LinearAlloc* linear_alloc,
                                                       PointerSize image_pointer_size) {
   void* data = linear_alloc->Alloc(Thread::Current(),
-                                   ImtConflictTable::ComputeSize(count,
-                                                                 image_pointer_size));
+                                   ImtConflictTable::ComputeSize(count, image_pointer_size),
+                                   LinearAllocKind::kNoGCRoots);
   return (data != nullptr) ? new (data) ImtConflictTable(count, image_pointer_size) : nullptr;
 }
 
@@ -6922,7 +6919,7 @@ class ClassLinker::LinkMethodsHelper {
         klass_(klass),
         self_(self),
         runtime_(runtime),
-        stack_(runtime->GetLinearAlloc()->GetArenaPool()),
+        stack_(runtime->GetArenaPool()),
         allocator_(&stack_),
         copied_method_records_(copied_method_records_initial_buffer_,
                                kCopiedMethodRecordInitialBufferSize,
@@ -7002,6 +6999,10 @@ class ClassLinker::LinkMethodsHelper {
                                                                             kMethodSize,
                                                                             kMethodAlignment);
         memset(old_methods, 0xFEu, old_size);
+        // Set size to 0 to avoid visiting declaring classes.
+        if (gUseUserfaultfd) {
+          old_methods->SetSize(0);
+        }
       }
     }
   }
@@ -7604,16 +7605,25 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
   const size_t old_methods_ptr_size = (old_methods != nullptr) ? old_size : 0;
   auto* methods = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(
       class_linker_->GetAllocatorForClassLoader(klass->GetClassLoader())->Realloc(
-          self_, old_methods, old_methods_ptr_size, new_size));
+          self_, old_methods, old_methods_ptr_size, new_size, LinearAllocKind::kArtMethodArray));
   CHECK(methods != nullptr);  // Native allocation failure aborts.
 
   if (methods != old_methods) {
-    StrideIterator<ArtMethod> out = methods->begin(kMethodSize, kMethodAlignment);
-    // Copy over the old methods. The `ArtMethod::CopyFrom()` is only necessary to not miss
-    // read barriers since `LinearAlloc::Realloc()` won't do read barriers when it copies.
-    for (auto& m : klass->GetMethods(kPointerSize)) {
-      out->CopyFrom(&m, kPointerSize);
-      ++out;
+    if (gUseReadBarrier) {
+      StrideIterator<ArtMethod> out = methods->begin(kMethodSize, kMethodAlignment);
+      // Copy over the old methods. The `ArtMethod::CopyFrom()` is only necessary to not miss
+      // read barriers since `LinearAlloc::Realloc()` won't do read barriers when it copies.
+      for (auto& m : klass->GetMethods(kPointerSize)) {
+        out->CopyFrom(&m, kPointerSize);
+        ++out;
+      }
+    } else if (gUseUserfaultfd) {
+      // Clear the declaring class of the old dangling method array so that GC doesn't
+      // try to update them, which could cause crashes in userfaultfd GC due to
+      // checks in post-compact address computation.
+      for (auto& m : klass->GetMethods(kPointerSize)) {
+        m.SetDeclaringClass(nullptr);
+      }
     }
   }
 
@@ -7862,20 +7872,6 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::FinalizeIfTable(
   }
 
   return true;
-}
-
-NO_INLINE
-static void ThrowIllegalAccessErrorForImplementingMethod(ObjPtr<mirror::Class> klass,
-                                                         ArtMethod* vtable_method,
-                                                         ArtMethod* interface_method)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(!vtable_method->IsAbstract());
-  DCHECK(!vtable_method->IsPublic());
-  ThrowIllegalAccessError(
-      klass,
-      "Method '%s' implementing interface method '%s' is not public",
-      vtable_method->PrettyMethod().c_str(),
-      interface_method->PrettyMethod().c_str());
 }
 
 template <PointerSize kPointerSize>
@@ -8131,15 +8127,11 @@ size_t ClassLinker::LinkMethodsHelper<kPointerSize>::AssignVTableIndexes(
           found = true;
         }
       }
+      found = found && vtable_method->IsPublic();
+
       uint32_t vtable_index = vtable_length;
       if (found) {
         DCHECK(vtable_method != nullptr);
-        if (!vtable_method->IsAbstract() && !vtable_method->IsPublic()) {
-          // FIXME: Delay the exception until we actually try to call the method. b/211854716
-          sants.reset();
-          ThrowIllegalAccessErrorForImplementingMethod(klass, vtable_method, interface_method);
-          return 0u;
-        }
         vtable_index = vtable_method->GetMethodIndexDuringLinking();
         if (!vtable_method->IsOverridableByDefaultMethod()) {
           method_array->SetElementPtrSize(j, vtable_index, kPointerSize);
@@ -8315,26 +8307,29 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
       ThrowClassFormatError(klass.Get(), "Too many methods on interface: %zu", num_virtual_methods);
       return false;
     }
+    // Assign each method an interface table index and set the default flag.
     bool has_defaults = false;
-    // Assign each method an IMT index and set the default flag.
     for (size_t i = 0; i < num_virtual_methods; ++i) {
       ArtMethod* m = klass->GetVirtualMethodDuringLinking(i, kPointerSize);
       m->SetMethodIndex(i);
-      if (!m->IsAbstract()) {
+      uint32_t access_flags = m->GetAccessFlags();
+      DCHECK(!ArtMethod::IsDefault(access_flags));
+      DCHECK_EQ(!ArtMethod::IsAbstract(access_flags), ArtMethod::IsInvokable(access_flags));
+      if (ArtMethod::IsInvokable(access_flags)) {
         // If the dex file does not support default methods, throw ClassFormatError.
         // This check is necessary to protect from odd cases, such as native default
         // methods, that the dex file verifier permits for old dex file versions. b/157170505
         // FIXME: This should be `if (!m->GetDexFile()->SupportsDefaultMethods())` but we're
         // currently running CTS tests for default methods with dex file version 035 which
         // does not support default methods. So, we limit this to native methods. b/157718952
-        if (m->IsNative()) {
+        if (ArtMethod::IsNative(access_flags)) {
           DCHECK(!m->GetDexFile()->SupportsDefaultMethods());
           ThrowClassFormatError(klass.Get(),
                                 "Dex file does not support default method '%s'",
                                 m->PrettyMethod().c_str());
           return false;
         }
-        if (!m->IsPublic()) {
+        if (!ArtMethod::IsPublic(access_flags)) {
           // The verifier should have caught the non-public method for dex version 37.
           // Just warn and skip it since this is from before default-methods so we don't
           // really need to care that it has code.
@@ -8342,7 +8337,7 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::LinkMethods(
                        << "This will be a fatal error in subsequent versions of android. "
                        << "Continuing anyway.";
         }
-        m->SetAccessFlags(m->GetAccessFlags() | kAccDefault);
+        m->SetAccessFlags(access_flags | kAccDefault);
         has_defaults = true;
       }
     }
@@ -10008,8 +10003,7 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
 
   StackHandleScope<5> hs(self);
 
-  ArtField* dex_elements_field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_DexPathList_dexElements);
+  ArtField* dex_elements_field = WellKnownClasses::dalvik_system_DexPathList_dexElements;
 
   Handle<mirror::Class> dex_elements_class(hs.NewHandle(dex_elements_field->ResolveType()));
   DCHECK(dex_elements_class != nullptr);
@@ -10021,14 +10015,13 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
   Handle<mirror::Class> h_dex_element_class =
       hs.NewHandle(dex_elements_class->GetComponentType());
 
-  ArtField* element_file_field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_DexPathList__Element_dexFile);
+  ArtField* element_file_field = WellKnownClasses::dalvik_system_DexPathList__Element_dexFile;
   DCHECK_EQ(h_dex_element_class.Get(), element_file_field->GetDeclaringClass());
 
-  ArtField* cookie_field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_cookie);
+  ArtField* cookie_field = WellKnownClasses::dalvik_system_DexFile_cookie;
   DCHECK_EQ(cookie_field->GetDeclaringClass(), element_file_field->LookupResolvedType());
 
-  ArtField* file_name_field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_fileName);
+  ArtField* file_name_field = WellKnownClasses::dalvik_system_DexFile_fileName;
   DCHECK_EQ(file_name_field->GetDeclaringClass(), element_file_field->LookupResolvedType());
 
   // Fill the elements array.
@@ -10100,15 +10093,13 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
       ObjPtr<mirror::ClassLoader>::DownCast(loader_class->AllocObject(self)));
   DCHECK(h_class_loader != nullptr);
   // Set DexPathList.
-  ArtField* path_list_field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_pathList);
+  ArtField* path_list_field = WellKnownClasses::dalvik_system_BaseDexClassLoader_pathList;
   DCHECK(path_list_field != nullptr);
   path_list_field->SetObject<false>(h_class_loader.Get(), h_dex_path_list.Get());
 
   // Make a pretend boot-classpath.
   // TODO: Should we scan the image?
-  ArtField* const parent_field =
-      jni::DecodeArtField(WellKnownClasses::java_lang_ClassLoader_parent);
+  ArtField* const parent_field = WellKnownClasses::java_lang_ClassLoader_parent;
   DCHECK(parent_field != nullptr);
   if (parent_loader.Get() == nullptr) {
     ScopedObjectAccessUnchecked soa(self);
@@ -10120,13 +10111,12 @@ ObjPtr<mirror::ClassLoader> ClassLinker::CreateWellKnownClassLoader(
   }
 
   ArtField* shared_libraries_field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+      WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   DCHECK(shared_libraries_field != nullptr);
   shared_libraries_field->SetObject<false>(h_class_loader.Get(), shared_libraries.Get());
 
   ArtField* shared_libraries_after_field =
-        jni::DecodeArtField(
-        WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoadersAfter);
+        WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoadersAfter;
   DCHECK(shared_libraries_after_field != nullptr);
   shared_libraries_after_field->SetObject<false>(h_class_loader.Get(),
                                                  shared_libraries_after.Get());
@@ -10201,6 +10191,18 @@ void ClassLinker::VisitClassLoaders(ClassLoaderVisitor* visitor) const {
   }
 }
 
+void ClassLinker::VisitDexCaches(DexCacheVisitor* visitor) const {
+  Thread* const self = Thread::Current();
+  for (const auto& it : dex_caches_) {
+    // Need to use DecodeJObject so that we get null for cleared JNI weak globals.
+    ObjPtr<mirror::DexCache> dex_cache = ObjPtr<mirror::DexCache>::DownCast(
+        self->DecodeJObject(it.second.weak_root));
+    if (dex_cache != nullptr) {
+      visitor->Visit(dex_cache);
+    }
+  }
+}
+
 void ClassLinker::VisitAllocators(AllocatorVisitor* visitor) const {
   for (const ClassLoaderData& data : class_loaders_) {
     LinearAlloc* alloc = data.allocator;
@@ -10241,6 +10243,23 @@ void ClassLinker::CleanupClassLoaders() {
         VLOG(class_linker) << "Freeing class loader";
         to_delete.push_back(data);
         it = class_loaders_.erase(it);
+      }
+    }
+  }
+  if (!to_delete.empty()) {
+    JavaVMExt* vm = self->GetJniEnv()->GetVm();
+    WriterMutexLock mu(self, *Locks::dex_lock_);
+    for (auto it = dex_caches_.begin(), end = dex_caches_.end(); it != end; ) {
+      const DexCacheData& data = it->second;
+      if (self->DecodeJObject(data.weak_root) == nullptr) {
+        DCHECK(to_delete.end() != std::find_if(
+            to_delete.begin(),
+            to_delete.end(),
+            [&](const ClassLoaderData& cld) { return cld.class_table == data.class_table; }));
+        vm->DeleteWeakGlobalRef(self, data.weak_root);
+        it = dex_caches_.erase(it);
+      } else {
+        ++it;
       }
     }
   }
