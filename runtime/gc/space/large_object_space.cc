@@ -336,7 +336,7 @@ class AllocationInfo {
 
 size_t FreeListSpace::GetSlotIndexForAllocationInfo(const AllocationInfo* info) const {
   DCHECK_GE(info, allocation_info_);
-  DCHECK_LT(info, reinterpret_cast<AllocationInfo*>(allocation_info_map_.End()));
+  DCHECK_LE(info, reinterpret_cast<AllocationInfo*>(allocation_info_map_.End()));
   return info - allocation_info_;
 }
 
@@ -352,9 +352,7 @@ inline bool FreeListSpace::SortByPrevFree::operator()(const AllocationInfo* a,
                                                       const AllocationInfo* b) const {
   if (a->GetPrevFree() < b->GetPrevFree()) return true;
   if (a->GetPrevFree() > b->GetPrevFree()) return false;
-  if (a->AlignSize() < b->AlignSize()) return true;
-  if (a->AlignSize() > b->AlignSize()) return false;
-  return reinterpret_cast<uintptr_t>(a) < reinterpret_cast<uintptr_t>(b);
+  return std::less()(a, b);
 }
 
 FreeListSpace* FreeListSpace::Create(const std::string& name, size_t size) {
@@ -424,6 +422,44 @@ void FreeListSpace::RemoveFreePrev(AllocationInfo* info) {
   free_blocks_.erase(it);
 }
 
+size_t FreeListSpace::FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) {
+  size_t total = 0;
+  std::deque<AllocationInfo*> free_list;
+  AllocationInfo* clear_block_begin = nullptr;
+
+  {
+    MutexLock mu(self, lock_);
+    for (size_t i = 0; i < num_ptrs; ++i) {
+      if (kDebugSpaces) {
+        CHECK(Contains(ptrs[i]));
+      }
+
+      AllocationInfo* info = GetAllocationInfoForAddress(reinterpret_cast<uintptr_t>(ptrs[i]));
+      DCHECK(!info->IsFree());
+      if (clear_block_begin == nullptr) {
+        clear_block_begin = info;
+      } else if (clear_block_begin->GetNextInfo() == info) {
+        // Merge adjacent chunks.
+        const size_t allocation_size = info->ByteSize();
+        clear_block_begin->SetByteSize(clear_block_begin->ByteSize() + allocation_size, false);
+        info->SetByteSize(allocation_size, true);
+      } else {
+        free_list.emplace_back(clear_block_begin);
+        clear_block_begin = info;
+      }
+    }
+  }
+
+  if (clear_block_begin) {
+    free_list.emplace_back(clear_block_begin);
+  }
+
+  for (const auto& iter : free_list) {
+    total += Free(self, reinterpret_cast<mirror::Object*>(GetAddressForAllocationInfo(iter)));
+  }
+  return total;
+}
+
 size_t FreeListSpace::Free(Thread* self, mirror::Object* obj) {
   DCHECK(Contains(obj)) << reinterpret_cast<void*>(Begin()) << " " << obj << " "
                         << reinterpret_cast<void*>(End());
@@ -457,6 +493,10 @@ size_t FreeListSpace::Free(Thread* self, mirror::Object* obj) {
     // The previous allocation info must not be free since we are supposed to always coalesce.
     DCHECK_EQ(info->GetPrevFreeBytes(), 0U) << "Previous allocation was free";
   }
+  // NOTE: next_info could be pointing right after the allocation_info_map_
+  // when freeing object in the very end of the space. But that's safe
+  // as we don't dereference it in that case. We only use it to calculate
+  // next_addr using offset within the map.
   uintptr_t next_addr = GetAddressForAllocationInfo(next_info);
   if (next_addr >= free_end_start) {
     // Easy case, the next chunk is the end free region.

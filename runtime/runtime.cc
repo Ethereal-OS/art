@@ -16,15 +16,13 @@
 
 #include "runtime.h"
 
-// sys/mount.h has to come before linux/fs.h due to redefinition of MS_RDONLY, MS_BIND, etc
-#include <sys/mount.h>
 #ifdef __linux__
-#include <linux/fs.h>
 #include <sys/prctl.h>
 #endif
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/mount.h>
 #include <sys/syscall.h>
 
 #if defined(__APPLE__)
@@ -199,10 +197,6 @@ static constexpr double kLowMemoryMinLoadFactor = 0.5;
 static constexpr double kLowMemoryMaxLoadFactor = 0.8;
 static constexpr double kNormalMinLoadFactor = 0.4;
 static constexpr double kNormalMaxLoadFactor = 0.7;
-
-// Extra added to the default heap growth multiplier. Used to adjust the GC ergonomics for the read
-// barrier config.
-static constexpr double kExtraDefaultHeapGrowthMultiplier = kUseReadBarrier ? 1.0 : 0.0;
 
 Runtime* Runtime::instance_ = nullptr;
 
@@ -406,6 +400,12 @@ Runtime::~Runtime() {
   if (oat_file_manager_ != nullptr) {
     oat_file_manager_->WaitForWorkersToBeCreated();
   }
+  // Disable GC before deleting the thread-pool and shutting down runtime as it
+  // restricts attaching new threads.
+  heap_->DisableGCForShutdown();
+  heap_->WaitForWorkersToBeCreated();
+  // Make sure to let the GC complete if it is running.
+  heap_->WaitForGcToComplete(gc::kGcCauseBackground, self);
 
   {
     ScopedTrace trace2("Wait for shutdown cond");
@@ -440,8 +440,6 @@ Runtime::~Runtime() {
     self = nullptr;
   }
 
-  // Make sure to let the GC complete if it is running.
-  heap_->WaitForGcToComplete(gc::kGcCauseBackground, self);
   heap_->DeleteThreadPool();
   if (oat_file_manager_ != nullptr) {
     oat_file_manager_->DeleteThreadPool();
@@ -516,7 +514,7 @@ Runtime::~Runtime() {
   // Destroy allocators before shutting down the MemMap because they may use it.
   java_vm_.reset();
   linear_alloc_.reset();
-  low_4gb_arena_pool_.reset();
+  linear_alloc_arena_pool_.reset();
   arena_pool_.reset();
   jit_arena_pool_.reset();
   protected_fault_page_.Reset();
@@ -990,6 +988,22 @@ bool Runtime::Start() {
     }
     CreateJitCodeCache(/*rwx_memory_allowed=*/true);
     CreateJit();
+#ifdef ADDRESS_SANITIZER
+    // (b/238730394): In older implementations of sanitizer + glibc there is a race between
+    // pthread_create and dlopen that could cause a deadlock. pthread_create interceptor in ASAN
+    // uses dl_pthread_iterator with a callback that could request a dl_load_lock via call to
+    // __tls_get_addr [1]. dl_pthread_iterate would already hold dl_load_lock so this could cause a
+    // deadlock. __tls_get_addr needs a dl_load_lock only when there is a dlopen happening in
+    // parallel. As a workaround we wait for the pthread_create (i.e JIT thread pool creation) to
+    // finish before going to the next phase. Creating a system class loader could need a dlopen so
+    // we wait here till threads are initialized.
+    // [1] https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/sanitizer_common/sanitizer_linux_libcdep.cpp#L408
+    // See this for more context: https://reviews.llvm.org/D98926
+    // TODO(b/238730394): Revisit this workaround once we migrate to musl libc.
+    if (jit_ != nullptr) {
+      jit_->GetThreadPool()->WaitForWorkersToBeCreated();
+    }
+#endif
   }
 
   // Send the start phase event. We have to wait till here as this is when the main thread peer
@@ -1144,7 +1158,6 @@ void Runtime::InitNonZygoteOrPostFork(
   }
 
   // Create the thread pools.
-  heap_->CreateThreadPool();
   // Avoid creating the runtime thread pool for system server since it will not be used and would
   // waste memory.
   if (!is_system_server) {
@@ -1587,9 +1600,11 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     // If low memory mode, use 1.0 as the multiplier by default.
     foreground_heap_growth_multiplier = 1.0f;
   } else {
+    // Extra added to the default heap growth multiplier for concurrent GC
+    // compaction algorithms. This is done for historical reasons.
+    // TODO: remove when we revisit heap configurations.
     foreground_heap_growth_multiplier =
-        runtime_options.GetOrDefault(Opt::ForegroundHeapGrowthMultiplier) +
-            kExtraDefaultHeapGrowthMultiplier;
+        runtime_options.GetOrDefault(Opt::ForegroundHeapGrowthMultiplier) + 1.0f;
   }
   XGcOption xgc_option = runtime_options.GetOrDefault(Opt::GcOption);
 
@@ -1617,9 +1632,9 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                        image_locations_,
                        instruction_set_,
                        // Override the collector type to CC if the read barrier config.
-                       kUseReadBarrier ? gc::kCollectorTypeCC : xgc_option.collector_type_,
-                       kUseReadBarrier ? BackgroundGcOption(gc::kCollectorTypeCCBackground)
-                                       : runtime_options.GetOrDefault(Opt::BackgroundGc),
+                       gUseReadBarrier ? gc::kCollectorTypeCC : xgc_option.collector_type_,
+                       gUseReadBarrier ? BackgroundGcOption(gc::kCollectorTypeCCBackground)
+                                       : BackgroundGcOption(xgc_option.collector_type_),
                        runtime_options.GetOrDefault(Opt::LargeObjectSpace),
                        runtime_options.GetOrDefault(Opt::LargeObjectThreshold),
                        runtime_options.GetOrDefault(Opt::ParallelGCThreads),
@@ -1700,9 +1715,14 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     jit_arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ false, "CompilerMetadata"));
   }
 
-  if (IsAotCompiler() && Is64BitInstructionSet(kRuntimeISA)) {
-    // 4gb, no malloc. Explanation in header.
-    low_4gb_arena_pool_.reset(new MemMapArenaPool(/* low_4gb= */ true));
+  // For 64 bit compilers, it needs to be in low 4GB in the case where we are cross compiling for a
+  // 32 bit target. In this case, we have 32 bit pointers in the dex cache arrays which can't hold
+  // when we have 64 bit ArtMethod pointers.
+  const bool low_4gb = IsAotCompiler() && Is64BitInstructionSet(kRuntimeISA);
+  if (gUseUserfaultfd) {
+    linear_alloc_arena_pool_.reset(new GcVisitedArenaPool(low_4gb));
+  } else if (low_4gb) {
+    linear_alloc_arena_pool_.reset(new MemMapArenaPool(low_4gb));
   }
   linear_alloc_.reset(CreateLinearAlloc());
 
@@ -2296,11 +2316,11 @@ void Runtime::DumpForSigQuit(std::ostream& os) {
 }
 
 void Runtime::DumpLockHolders(std::ostream& os) {
-  uint64_t mutator_lock_owner = Locks::mutator_lock_->GetExclusiveOwnerTid();
+  pid_t mutator_lock_owner = Locks::mutator_lock_->GetExclusiveOwnerTid();
   pid_t thread_list_lock_owner = GetThreadList()->GetLockOwner();
   pid_t classes_lock_owner = GetClassLinker()->GetClassesLockOwner();
   pid_t dex_lock_owner = GetClassLinker()->GetDexLockOwner();
-  if ((thread_list_lock_owner | classes_lock_owner | dex_lock_owner) != 0) {
+  if ((mutator_lock_owner | thread_list_lock_owner | classes_lock_owner | dex_lock_owner) != 0) {
     os << "Mutator lock exclusive owner tid: " << mutator_lock_owner << "\n"
        << "ThreadList lock owner tid: " << thread_list_lock_owner << "\n"
        << "ClassLinker classes lock owner tid: " << classes_lock_owner << "\n"
@@ -2457,6 +2477,9 @@ void Runtime::VisitConcurrentRoots(RootVisitor* visitor, VisitRootFlags flags) {
   class_linker_->VisitRoots(visitor, flags);
   jni_id_manager_->VisitRoots(visitor);
   heap_->VisitAllocationRecords(visitor);
+  if (jit_ != nullptr) {
+    jit_->GetCodeCache()->VisitRoots(visitor);
+  }
   if ((flags & kVisitRootFlagNewRoots) == 0) {
     // Guaranteed to have no new roots in the constant roots.
     VisitConstantRoots(visitor);
@@ -2585,7 +2608,7 @@ ArtMethod* Runtime::CreateCalleeSaveMethod() {
 }
 
 void Runtime::DisallowNewSystemWeaks() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   monitor_list_->DisallowNewMonitors();
   intern_table_->ChangeWeakRootState(gc::kWeakRootStateNoReadsOrWrites);
   java_vm_->DisallowNewWeakGlobals();
@@ -2601,7 +2624,7 @@ void Runtime::DisallowNewSystemWeaks() {
 }
 
 void Runtime::AllowNewSystemWeaks() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   monitor_list_->AllowNewMonitors();
   intern_table_->ChangeWeakRootState(gc::kWeakRootStateNormal);  // TODO: Do this in the sweeping.
   java_vm_->AllowNewWeakGlobals();
@@ -3060,13 +3083,12 @@ bool Runtime::IsAsyncDeoptimizeable(uintptr_t code) const {
          GetJit()->GetCodeCache()->PrivateRegionContainsPc(reinterpret_cast<const void*>(code));
 }
 
+
 LinearAlloc* Runtime::CreateLinearAlloc() {
-  // For 64 bit compilers, it needs to be in low 4GB in the case where we are cross compiling for a
-  // 32 bit target. In this case, we have 32 bit pointers in the dex cache arrays which can't hold
-  // when we have 64 bit ArtMethod pointers.
-  return (IsAotCompiler() && Is64BitInstructionSet(kRuntimeISA))
-      ? new LinearAlloc(low_4gb_arena_pool_.get())
-      : new LinearAlloc(arena_pool_.get());
+  ArenaPool* pool = linear_alloc_arena_pool_.get();
+  return pool != nullptr
+      ? new LinearAlloc(pool, gUseUserfaultfd)
+      : new LinearAlloc(arena_pool_.get(), /*track_allocs=*/ false);
 }
 
 double Runtime::GetHashTableMinLoadFactor() const {
@@ -3324,8 +3346,12 @@ void Runtime::SetJniIdType(JniIdType t) {
   WellKnownClasses::HandleJniIdTypeChange(Thread::Current()->GetJniEnv());
 }
 
+bool Runtime::IsSystemServerProfiled() const {
+  return IsSystemServer() && jit_options_->GetSaveProfilingInfo();
+}
+
 bool Runtime::GetOatFilesExecutable() const {
-  return !IsAotCompiler() && !(IsSystemServer() && jit_options_->GetSaveProfilingInfo());
+  return !IsAotCompiler() && !IsSystemServerProfiled();
 }
 
 void Runtime::ProcessWeakClass(GcRoot<mirror::Class>* root_ptr,
@@ -3358,6 +3384,14 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
                                   const uint8_t* map_begin,
                                   const uint8_t* map_end,
                                   const std::string& file_name) {
+  // Short-circuit the madvise optimization for background processes. This
+  // avoids IO and memory contention with foreground processes, particularly
+  // those involving app startup.
+  const Runtime* runtime = Runtime::Current();
+  if (runtime != nullptr && !runtime->InJankPerceptibleProcessState()) {
+    return;
+  }
+
   // Ideal blockTransferSize for madvising files (128KiB)
   static constexpr size_t kIdealIoTransferSizeBytes = 128*1024;
 

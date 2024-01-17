@@ -30,7 +30,6 @@ art_cc_binary {
     compile_multilib: "both",
 
     srcs: ["dalvikvm.cc"],
-    cflags: ["-O3"],
     shared_libs: [
         "liblog",
         "libnativehelper",

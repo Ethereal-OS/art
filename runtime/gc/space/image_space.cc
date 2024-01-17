@@ -49,6 +49,7 @@
 #include "dex/art_dex_file_loader.h"
 #include "dex/dex_file_loader.h"
 #include "exec_utils.h"
+#include "fmt/format.h"
 #include "gc/accounting/space_bitmap-inl.h"
 #include "gc/task_processor.h"
 #include "image-inl.h"
@@ -69,13 +70,19 @@ namespace art {
 namespace gc {
 namespace space {
 
-using android::base::Join;
-using android::base::StringAppendF;
-using android::base::StringPrintf;
+namespace {
+
+using ::android::base::Join;
+using ::android::base::StringAppendF;
+using ::android::base::StringPrintf;
+
+using ::fmt::literals::operator""_format;  // NOLINT
 
 // We do not allow the boot image and extensions to take more than 1GiB. They are
 // supposed to be much smaller and allocating more that this would likely fail anyway.
 static constexpr size_t kMaxTotalImageReservationSize = 1 * GB;
+
+}  // namespace
 
 Atomic<uint32_t> ImageSpace::bitmap_index_(0);
 
@@ -198,7 +205,6 @@ void ImageSpace::VerifyImageAllocations() {
 // Helper class for relocating from one range of memory to another.
 class RelocationRange {
  public:
-  RelocationRange() = default;
   RelocationRange(const RelocationRange&) = default;
   RelocationRange(uintptr_t source, uintptr_t dest, uintptr_t length)
       : source_(source),
@@ -3111,8 +3117,24 @@ class ImageSpace::BootImageLoader {
         return false;
       }
     }
+
+    // As an optimization, madvise the oat file into memory if it's being used
+    // for execution with an active runtime. This can significantly improve
+    // ZygoteInit class preload performance.
+    if (executable_) {
+      Runtime* runtime = Runtime::Current();
+      if (runtime != nullptr) {
+        Runtime::MadviseFileForRange(runtime->GetMadviseWillNeedSizeOdex(),
+                                     oat_file->Size(),
+                                     oat_file->Begin(),
+                                     oat_file->End(),
+                                     oat_file->GetLocation());
+      }
+    }
+
     space->oat_file_ = std::move(oat_file);
     space->oat_file_non_owned_ = space->oat_file_.get();
+
     return true;
   }
 
@@ -3563,6 +3585,15 @@ bool ImageSpace::ValidateOatFile(const OatFile& oat_file,
                                  ArrayRef<const std::string> dex_filenames,
                                  ArrayRef<const int> dex_fds) {
   if (!ValidateApexVersions(oat_file, error_msg)) {
+    return false;
+  }
+
+  // For a boot image, the key value store only exists in the first OAT file. Skip other OAT files.
+  if (oat_file.GetOatHeader().GetKeyValueStoreSize() != 0 &&
+      oat_file.GetOatHeader().IsConcurrentCopying() != gUseReadBarrier) {
+    *error_msg =
+        "ValidateOatFile found read barrier state mismatch (oat file: {}, runtime: {})"_format(
+            oat_file.GetOatHeader().IsConcurrentCopying(), gUseReadBarrier);
     return false;
   }
 

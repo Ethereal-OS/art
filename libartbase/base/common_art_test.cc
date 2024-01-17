@@ -69,15 +69,7 @@ ScratchDir::ScratchDir(bool keep_files) : keep_files_(keep_files) {
 
 ScratchDir::~ScratchDir() {
   if (!keep_files_) {
-    // Recursively delete the directory and all its content.
-    nftw(path_.c_str(), [](const char* name, const struct stat*, int type, struct FTW *) {
-      if (type == FTW_F) {
-        unlink(name);
-      } else if (type == FTW_DP) {
-        rmdir(name);
-      }
-      return 0;
-    }, 256 /* max open file descriptors */, FTW_DEPTH);
+    std::filesystem::remove_all(path_);
   }
 }
 
@@ -592,6 +584,7 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
   result.stage = ForkAndExecResult::kLink;
 
   std::vector<const char*> c_args;
+  c_args.reserve(argv.size() + 1);
   for (const std::string& str : argv) {
     c_args.push_back(str.c_str());
   }

@@ -38,6 +38,7 @@
 #include "handle.h"
 #include "handle_scope.h"
 #include "interpreter/interpreter_cache.h"
+#include "interpreter/shadow_frame.h"
 #include "javaheapprof/javaheapsampler.h"
 #include "jvalue.h"
 #include "managed_stack.h"
@@ -188,7 +189,7 @@ enum class WeakRefAccessState : int32_t {
 // This should match RosAlloc::kNumThreadLocalSizeBrackets.
 static constexpr size_t kNumRosAllocThreadLocalSizeBracketsInThread = 16;
 
-static constexpr size_t kSharedMethodHotnessThreshold = 0xffff;
+static constexpr size_t kSharedMethodHotnessThreshold = 0x1fff;
 
 // Thread's stack layout for implicit stack overflow checks:
 //
@@ -373,11 +374,11 @@ class Thread {
   void WaitForFlipFunction(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
   gc::accounting::AtomicStack<mirror::Object>* GetThreadLocalMarkStack() {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tlsPtr_.thread_local_mark_stack;
   }
   void SetThreadLocalMarkStack(gc::accounting::AtomicStack<mirror::Object>* stack) {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     tlsPtr_.thread_local_mark_stack = stack;
   }
 
@@ -1011,7 +1012,7 @@ class Thread {
   }
 
   bool GetIsGcMarking() const {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tls32_.is_gc_marking;
   }
 
@@ -1020,24 +1021,21 @@ class Thread {
   bool GetWeakRefAccessEnabled() const;  // Only safe for current thread.
 
   void SetWeakRefAccessEnabled(bool enabled) {
-    CHECK(kUseReadBarrier);
+    DCHECK(gUseReadBarrier);
     WeakRefAccessState new_state = enabled ?
         WeakRefAccessState::kEnabled : WeakRefAccessState::kDisabled;
     tls32_.weak_ref_access_enabled.store(new_state, std::memory_order_release);
   }
 
   uint32_t GetDisableThreadFlipCount() const {
-    CHECK(kUseReadBarrier);
     return tls32_.disable_thread_flip_count;
   }
 
   void IncrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     ++tls32_.disable_thread_flip_count;
   }
 
   void DecrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     DCHECK_GT(tls32_.disable_thread_flip_count, 0U);
     --tls32_.disable_thread_flip_count;
   }
@@ -1091,7 +1089,8 @@ class Thread {
   void AssertHasDeoptimizationContext()
       REQUIRES_SHARED(Locks::mutator_lock_);
   void PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type);
-  ShadowFrame* PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present = true);
+  ShadowFrame* PopStackedShadowFrame();
+  ShadowFrame* MaybePopDeoptimizedStackedShadowFrame();
 
   // For debugger, find the shadow frame that corresponds to a frame id.
   // Or return null if there is none.
@@ -1206,6 +1205,10 @@ class Thread {
     DCHECK_LE(tlsPtr_.thread_local_end, tlsPtr_.thread_local_limit);
   }
 
+  // Called from Concurrent mark-compact GC to slide the TLAB pointers backwards
+  // to adjust to post-compact addresses.
+  void AdjustTlab(size_t slide_bytes);
+
   // Doesn't check that there is room.
   mirror::Object* AllocTlab(size_t bytes);
   void SetTlab(uint8_t* start, uint8_t* end, uint8_t* limit);
@@ -1298,11 +1301,12 @@ class Thread {
 
   bool IncrementMakeVisiblyInitializedCounter() {
     tls32_.make_visibly_initialized_counter += 1u;
-    return tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount;
-  }
-
-  void ClearMakeVisiblyInitializedCounter() {
-    tls32_.make_visibly_initialized_counter = 0u;
+    DCHECK_LE(tls32_.make_visibly_initialized_counter, kMakeVisiblyInitializedCounterTriggerCount);
+    if (tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount) {
+      tls32_.make_visibly_initialized_counter = 0u;
+      return true;
+    }
+    return false;
   }
 
   void PushVerifier(verifier::MethodVerifier* verifier);
@@ -2152,17 +2156,18 @@ class ScopedAllowThreadSuspension {
 
 class ScopedStackedShadowFramePusher {
  public:
-  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf, StackedShadowFrameType type)
-    : self_(self), type_(type) {
-    self_->PushStackedShadowFrame(sf, type);
+  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf) : self_(self), sf_(sf) {
+    DCHECK_EQ(sf->GetLink(), nullptr);
+    self_->PushStackedShadowFrame(sf, StackedShadowFrameType::kShadowFrameUnderConstruction);
   }
   ~ScopedStackedShadowFramePusher() {
-    self_->PopStackedShadowFrame(type_);
+    ShadowFrame* sf = self_->PopStackedShadowFrame();
+    DCHECK_EQ(sf, sf_);
   }
 
  private:
   Thread* const self_;
-  const StackedShadowFrameType type_;
+  ShadowFrame* const sf_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedStackedShadowFramePusher);
 };
@@ -2186,13 +2191,13 @@ class ScopedTransitioningToRunnable : public ValueObject {
   explicit ScopedTransitioningToRunnable(Thread* self)
       : self_(self) {
     DCHECK_EQ(self, Thread::Current());
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(true);
     }
   }
 
   ~ScopedTransitioningToRunnable() {
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(false);
     }
   }

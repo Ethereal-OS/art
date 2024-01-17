@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "android-base/file.h"
@@ -39,6 +40,17 @@ namespace odrefresh {
 // The prefixes of system properties that odrefresh keeps track of. Odrefresh will recompile
 // everything if any property matching a prefix changes.
 constexpr const char* kCheckedSystemPropertyPrefixes[]{"dalvik.vm.", "ro.dalvik.vm."};
+
+// The list of system properties that odrefresh ignores. They don't affect compilation results.
+const std::unordered_set<std::string> kIgnoredSystemProperties{
+    "dalvik.vm.dex2oat-cpu-set",
+    "dalvik.vm.dex2oat-threads",
+    "dalvik.vm.boot-dex2oat-cpu-set",
+    "dalvik.vm.boot-dex2oat-threads",
+    "dalvik.vm.restore-dex2oat-cpu-set",
+    "dalvik.vm.restore-dex2oat-threads",
+    "dalvik.vm.background-dex2oat-cpu-set",
+    "dalvik.vm.background-dex2oat-threads"};
 
 struct SystemPropertyConfig {
   const char* name;
@@ -83,6 +95,7 @@ class OdrConfig final {
   InstructionSet isa_;
   std::string program_name_;
   std::string system_server_classpath_;
+  std::string boot_image_compiler_filter_;
   std::string system_server_compiler_filter_;
   ZygoteKind zygote_kind_;
   std::string boot_classpath_;
@@ -168,6 +181,9 @@ class OdrConfig final {
   const std::string& GetSystemServerClasspath() const {
     return system_server_classpath_;
   }
+  const std::string& GetBootImageCompilerFilter() const {
+    return boot_image_compiler_filter_;
+  }
   const std::string& GetSystemServerCompilerFilter() const {
     return system_server_compiler_filter_;
   }
@@ -204,6 +220,9 @@ class OdrConfig final {
     system_server_classpath_ = classpath;
   }
 
+  void SetBootImageCompilerFilter(const std::string& filter) {
+    boot_image_compiler_filter_ = filter;
+  }
   void SetSystemServerCompilerFilter(const std::string& filter) {
     system_server_compiler_filter_ = filter;
   }

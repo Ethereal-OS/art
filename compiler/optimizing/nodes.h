@@ -406,6 +406,7 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
         has_loops_(false),
         has_irreducible_loops_(false),
         has_direct_critical_native_call_(false),
+        has_always_throwing_invokes_(false),
         dead_reference_safe_(dead_reference_safe),
         debuggable_(debuggable),
         current_instruction_id_(start_instruction_id),
@@ -704,6 +705,9 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   bool HasDirectCriticalNativeCall() const { return has_direct_critical_native_call_; }
   void SetHasDirectCriticalNativeCall(bool value) { has_direct_critical_native_call_ = value; }
 
+  bool HasAlwaysThrowingInvokes() const { return has_always_throwing_invokes_; }
+  void SetHasAlwaysThrowingInvokes(bool value) { has_always_throwing_invokes_ = value; }
+
   ArtMethod* GetArtMethod() const { return art_method_; }
   void SetArtMethod(ArtMethod* method) { art_method_ = method; }
 
@@ -724,7 +728,7 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   void IncrementNumberOfCHAGuards() { number_of_cha_guards_++; }
 
  private:
-  void RemoveInstructionsAsUsersFromDeadBlocks(const ArenaBitVector& visited) const;
+  void RemoveDeadBlocksInstructionsAsUsersAndDisconnect(const ArenaBitVector& visited) const;
   void RemoveDeadBlocks(const ArenaBitVector& visited);
 
   template <class InstructionType, typename ValueType>
@@ -825,6 +829,9 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   // Flag whether there are any direct calls to native code registered
   // for @CriticalNative methods.
   bool has_direct_critical_native_call_;
+
+  // Flag whether the graph contains invokes that always throw.
+  bool has_always_throwing_invokes_;
 
   // Is the code known to be robust against eliminating dead references
   // and the effects of early finalization? If false, dead reference variables
@@ -1291,7 +1298,7 @@ class HBasicBlock : public ArenaObject<kArenaAllocBasicBlock> {
   // graph, create a Goto at the end of the former block and will create an edge
   // between the blocks. It will not, however, update the reverse post order or
   // loop and try/catch information.
-  HBasicBlock* SplitBefore(HInstruction* cursor);
+  HBasicBlock* SplitBefore(HInstruction* cursor, bool require_graph_not_in_ssa_form = true);
 
   // Split the block into two blocks just before `cursor`. Returns the newly
   // created block. Note that this method just updates raw block information,
@@ -1331,6 +1338,20 @@ class HBasicBlock : public ArenaObject<kArenaAllocBasicBlock> {
   // The block must not dominate any other block. Predecessors and successors
   // are safely updated.
   void DisconnectAndDelete();
+
+  // Disconnects `this` from all its successors and updates their phis, if the successors have them.
+  // If `visited` is provided, it will use the information to know if a successor is reachable and
+  // skip updating those phis.
+  void DisconnectFromSuccessors(const ArenaBitVector* visited = nullptr);
+
+  // Removes the catch phi uses of the instructions in `this`, and then remove the instruction
+  // itself. If `building_dominator_tree` is true, it will not remove the instruction as user, since
+  // we do it in a previous step. This is a special case for building up the dominator tree: we want
+  // to eliminate uses before inputs but we don't have domination information, so we remove all
+  // connections from input/uses first before removing any instruction.
+  // This method assumes the instructions have been removed from all users with the exception of
+  // catch phis because of missing exceptional edges in the graph.
+  void RemoveCatchPhiUsesAndInstruction(bool building_dominator_tree);
 
   void AddInstruction(HInstruction* instruction);
   // Insert `instruction` before/after an existing instruction `cursor`.
@@ -2419,9 +2440,12 @@ class HInstruction : public ArenaObject<kArenaAllocInstruction> {
     return IsRemovable() && !HasUses();
   }
 
-  // Does this instruction strictly dominate `other_instruction`?
-  // Returns false if this instruction and `other_instruction` are the same.
-  // Aborts if this instruction and `other_instruction` are both phis.
+  // Does this instruction dominate `other_instruction`?
+  // Aborts if this instruction and `other_instruction` are different phis.
+  bool Dominates(HInstruction* other_instruction) const;
+
+  // Same but with `strictly dominates` i.e. returns false if this instruction and
+  // `other_instruction` are the same.
   bool StrictlyDominates(HInstruction* other_instruction) const;
 
   int GetId() const { return id_; }
@@ -2486,7 +2510,9 @@ class HInstruction : public ArenaObject<kArenaAllocInstruction> {
   void SetLocations(LocationSummary* locations) { locations_ = locations; }
 
   void ReplaceWith(HInstruction* instruction);
-  void ReplaceUsesDominatedBy(HInstruction* dominator, HInstruction* replacement);
+  void ReplaceUsesDominatedBy(HInstruction* dominator,
+                              HInstruction* replacement,
+                              bool strictly_dominated = true);
   void ReplaceEnvUsesDominatedBy(HInstruction* dominator, HInstruction* replacement);
   void ReplaceInput(HInstruction* replacement, size_t index);
 
@@ -6362,6 +6388,27 @@ class HPredicatedInstanceFieldGet final : public HExpression<2> {
   const FieldInfo field_info_;
 };
 
+enum class WriteBarrierKind {
+  // Emit the write barrier, with a runtime optimization which checks if the value that it is being
+  // set is null.
+  kEmitWithNullCheck,
+  // Emit the write barrier, without the runtime null check optimization. This could be set because:
+  //  A) It is a write barrier for an ArraySet (which does the optimization with the type check, so
+  //  it never does the optimization at the write barrier stage)
+  //  B) We know that the input can't be null
+  //  C) This write barrier is actually several write barriers coalesced into one. Potentially we
+  //  could ask if every value is null for a runtime optimization at the cost of compile time / code
+  //  size. At the time of writing it was deemed not worth the effort.
+  kEmitNoNullCheck,
+  // Skip emitting the write barrier. This could be set because:
+  //  A) The write barrier is not needed (e.g. it is not a reference, or the value is the null
+  //  constant)
+  //  B) This write barrier was coalesced into another one so there's no need to emit it.
+  kDontEmit,
+  kLast = kDontEmit
+};
+std::ostream& operator<<(std::ostream& os, WriteBarrierKind rhs);
+
 class HInstanceFieldSet final : public HExpression<2> {
  public:
   HInstanceFieldSet(HInstruction* object,
@@ -6386,6 +6433,7 @@ class HInstanceFieldSet final : public HExpression<2> {
                     dex_file) {
     SetPackedFlag<kFlagValueCanBeNull>(true);
     SetPackedFlag<kFlagIsPredicatedSet>(false);
+    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitWithNullCheck);
     SetRawInputAt(0, object);
     SetRawInputAt(1, value);
   }
@@ -6406,6 +6454,12 @@ class HInstanceFieldSet final : public HExpression<2> {
   void ClearValueCanBeNull() { SetPackedFlag<kFlagValueCanBeNull>(false); }
   bool GetIsPredicatedSet() const { return GetPackedFlag<kFlagIsPredicatedSet>(); }
   void SetIsPredicatedSet(bool value = true) { SetPackedFlag<kFlagIsPredicatedSet>(value); }
+  WriteBarrierKind GetWriteBarrierKind() { return GetPackedField<WriteBarrierKindField>(); }
+  void SetWriteBarrierKind(WriteBarrierKind kind) {
+    DCHECK(kind != WriteBarrierKind::kEmitWithNullCheck)
+        << "We shouldn't go back to the original value.";
+    SetPackedField<WriteBarrierKindField>(kind);
+  }
 
   DECLARE_INSTRUCTION(InstanceFieldSet);
 
@@ -6415,11 +6469,17 @@ class HInstanceFieldSet final : public HExpression<2> {
  private:
   static constexpr size_t kFlagValueCanBeNull = kNumberOfGenericPackedBits;
   static constexpr size_t kFlagIsPredicatedSet = kFlagValueCanBeNull + 1;
-  static constexpr size_t kNumberOfInstanceFieldSetPackedBits = kFlagIsPredicatedSet + 1;
+  static constexpr size_t kWriteBarrierKind = kFlagIsPredicatedSet + 1;
+  static constexpr size_t kWriteBarrierKindSize =
+      MinimumBitsToStore(static_cast<size_t>(WriteBarrierKind::kLast));
+  static constexpr size_t kNumberOfInstanceFieldSetPackedBits =
+      kWriteBarrierKind + kWriteBarrierKindSize;
   static_assert(kNumberOfInstanceFieldSetPackedBits <= kMaxNumberOfPackedBits,
                 "Too many packed fields.");
 
   const FieldInfo field_info_;
+  using WriteBarrierKindField =
+      BitField<WriteBarrierKind, kWriteBarrierKind, kWriteBarrierKindSize>;
 };
 
 class HArrayGet final : public HExpression<2> {
@@ -6540,6 +6600,8 @@ class HArraySet final : public HExpression<3> {
     SetPackedFlag<kFlagNeedsTypeCheck>(value->GetType() == DataType::Type::kReference);
     SetPackedFlag<kFlagValueCanBeNull>(true);
     SetPackedFlag<kFlagStaticTypeOfArrayIsObjectArray>(false);
+    // ArraySets never do the null check optimization at the write barrier stage.
+    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitNoNullCheck);
     SetRawInputAt(0, array);
     SetRawInputAt(1, index);
     SetRawInputAt(2, value);
@@ -6560,8 +6622,10 @@ class HArraySet final : public HExpression<3> {
     return false;
   }
 
-  void ClearNeedsTypeCheck() {
+  void ClearTypeCheck() {
     SetPackedFlag<kFlagNeedsTypeCheck>(false);
+    // Clear the `CanTriggerGC` flag too as we can only trigger a GC when doing a type check.
+    SetSideEffects(GetSideEffects().Exclusion(SideEffects::CanTriggerGC()));
   }
 
   void ClearValueCanBeNull() {
@@ -6610,6 +6674,16 @@ class HArraySet final : public HExpression<3> {
                                                       : SideEffects::None();
   }
 
+  WriteBarrierKind GetWriteBarrierKind() { return GetPackedField<WriteBarrierKindField>(); }
+
+  void SetWriteBarrierKind(WriteBarrierKind kind) {
+    DCHECK(kind != WriteBarrierKind::kEmitNoNullCheck)
+        << "We shouldn't go back to the original value.";
+    DCHECK(kind != WriteBarrierKind::kEmitWithNullCheck)
+        << "We never do the null check optimization for ArraySets.";
+    SetPackedField<WriteBarrierKindField>(kind);
+  }
+
   DECLARE_INSTRUCTION(ArraySet);
 
  protected:
@@ -6625,11 +6699,16 @@ class HArraySet final : public HExpression<3> {
   // Cached information for the reference_type_info_ so that codegen
   // does not need to inspect the static type.
   static constexpr size_t kFlagStaticTypeOfArrayIsObjectArray = kFlagValueCanBeNull + 1;
-  static constexpr size_t kNumberOfArraySetPackedBits =
-      kFlagStaticTypeOfArrayIsObjectArray + 1;
+  static constexpr size_t kWriteBarrierKind = kFlagStaticTypeOfArrayIsObjectArray + 1;
+  static constexpr size_t kWriteBarrierKindSize =
+      MinimumBitsToStore(static_cast<size_t>(WriteBarrierKind::kLast));
+  static constexpr size_t kNumberOfArraySetPackedBits = kWriteBarrierKind + kWriteBarrierKindSize;
   static_assert(kNumberOfArraySetPackedBits <= kMaxNumberOfPackedBits, "Too many packed fields.");
   using ExpectedComponentTypeField =
       BitField<DataType::Type, kFieldExpectedComponentType, kFieldExpectedComponentTypeSize>;
+
+  using WriteBarrierKindField =
+      BitField<WriteBarrierKind, kWriteBarrierKind, kWriteBarrierKindSize>;
 };
 
 class HArrayLength final : public HExpression<1> {
@@ -7222,6 +7301,10 @@ class HLoadMethodHandle final : public HInstruction {
     return SideEffects::CanTriggerGC();
   }
 
+  bool CanThrow() const override { return true; }
+
+  bool NeedsEnvironment() const override { return true; }
+
   DECLARE_INSTRUCTION(LoadMethodHandle);
 
  protected:
@@ -7265,6 +7348,10 @@ class HLoadMethodType final : public HInstruction {
   static SideEffects SideEffectsForArchRuntimeCalls() {
     return SideEffects::CanTriggerGC();
   }
+
+  bool CanThrow() const override { return true; }
+
+  bool NeedsEnvironment() const override { return true; }
 
   DECLARE_INSTRUCTION(LoadMethodType);
 
@@ -7400,6 +7487,7 @@ class HStaticFieldSet final : public HExpression<2> {
                     declaring_class_def_index,
                     dex_file) {
     SetPackedFlag<kFlagValueCanBeNull>(true);
+    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitWithNullCheck);
     SetRawInputAt(0, cls);
     SetRawInputAt(1, value);
   }
@@ -7415,6 +7503,13 @@ class HStaticFieldSet final : public HExpression<2> {
   bool GetValueCanBeNull() const { return GetPackedFlag<kFlagValueCanBeNull>(); }
   void ClearValueCanBeNull() { SetPackedFlag<kFlagValueCanBeNull>(false); }
 
+  WriteBarrierKind GetWriteBarrierKind() { return GetPackedField<WriteBarrierKindField>(); }
+  void SetWriteBarrierKind(WriteBarrierKind kind) {
+    DCHECK(kind != WriteBarrierKind::kEmitWithNullCheck)
+        << "We shouldn't go back to the original value.";
+    SetPackedField<WriteBarrierKindField>(kind);
+  }
+
   DECLARE_INSTRUCTION(StaticFieldSet);
 
  protected:
@@ -7422,11 +7517,17 @@ class HStaticFieldSet final : public HExpression<2> {
 
  private:
   static constexpr size_t kFlagValueCanBeNull = kNumberOfGenericPackedBits;
-  static constexpr size_t kNumberOfStaticFieldSetPackedBits = kFlagValueCanBeNull + 1;
+  static constexpr size_t kWriteBarrierKind = kFlagValueCanBeNull + 1;
+  static constexpr size_t kWriteBarrierKindSize =
+      MinimumBitsToStore(static_cast<size_t>(WriteBarrierKind::kLast));
+  static constexpr size_t kNumberOfStaticFieldSetPackedBits =
+      kWriteBarrierKind + kWriteBarrierKindSize;
   static_assert(kNumberOfStaticFieldSetPackedBits <= kMaxNumberOfPackedBits,
                 "Too many packed fields.");
 
   const FieldInfo field_info_;
+  using WriteBarrierKindField =
+      BitField<WriteBarrierKind, kWriteBarrierKind, kWriteBarrierKindSize>;
 };
 
 class HStringBuilderAppend final : public HVariableInputSizeInstruction {
