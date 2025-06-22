@@ -635,6 +635,7 @@ public class DexUseManagerLocal {
             if (dexPath.length() > MAX_PATH_LENGTH) {
                 throw new IllegalArgumentException(
                         "Dex path too long - exceeds " + MAX_PATH_LENGTH + " chars");
+            }
 
             String errorMsg = ArtJni.validateDexPath(entry.getKey());
             if (errorMsg != null) {
